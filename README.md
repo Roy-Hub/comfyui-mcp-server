@@ -6,6 +6,15 @@ A lightweight MCP (Model Context Protocol) server that lets AI agents generate a
 
 You run the server, connect a client, and issue tool calls. Everything else is optional depth.
 
+> **Fork note:** This is a fork of [joenorton/comfyui-mcp-server](https://github.com/joenorton/comfyui-mcp-server). It adds:
+> - on-demand ComfyUI lifecycle tools (`start_comfyui`, `stop_comfyui`, `get_comfyui_status`)
+> - auto-discovery of workflows saved in ComfyUI
+> - a `list_all_models` tool covering non-checkpoint loaders
+> - a configurable workflow directory kept outside the repo
+> - a configurable host/port (default port `9001`)
+>
+> See [Fork Additions](#fork-additions).
+
 ---
 
 ## Quick Start (2–3 minutes)
@@ -15,14 +24,15 @@ This proves everything is working.
 ### 1) Clone and set up
 
 ```bash
-git clone https://github.com/joenorton/comfyui-mcp-server.git
+git clone https://github.com/Roy-Hub/comfyui-mcp-server.git
 cd comfyui-mcp-server
 pip install -r requirements.txt
 ```
 
 ### 2) Start ComfyUI
 
-Make sure ComfyUI is installed and running locally.
+Make sure ComfyUI is installed and running locally. (Or, if you have set up the optional
+[control API](#on-demand-comfyui-lifecycle), skip this step. Agents can start ComfyUI on demand with `start_comfyui`.)
 
 ```bash
 cd <ComfyUI_dir>
@@ -40,8 +50,11 @@ python server.py
 The server listens at:
 
 ```
-http://127.0.0.1:9000/mcp
+http://127.0.0.1:9001/mcp
 ```
+
+The port and bind address are set with `COMFY_MCP_PORT` (default `9001`) and `COMFY_MCP_HOST` (default `0.0.0.0`).
+The server starts even if ComfyUI is not running yet.
 
 ### 4) Verify it works (no AI client required)
 
@@ -84,7 +97,7 @@ Create a project-scoped `.mcp.json` file:
   "mcpServers": {
     "comfyui-mcp-server": {
       "type": "streamable-http",
-      "url": "http://127.0.0.1:9000/mcp"
+      "url": "http://127.0.0.1:9001/mcp"
     }
   }
 }
@@ -123,7 +136,7 @@ If you’ve used earlier versions of this project, a few things have changed.
 
 ### What’s the Same
 - You still run a local MCP server that delegates execution to ComfyUI
-- Workflows are still JSON files placed in the `workflows/` directory
+- Workflows are still JSON files placed in a workflow directory (`workflows/` by default, or `COMFY_MCP_WORKFLOW_DIR`)
 - Image generation behavior is unchanged at its core
 
 ### What’s New
@@ -174,14 +187,21 @@ No migration is required unless you want the new capabilities.
 
 ### Configuration Tools
 
-- **`list_models`**: List available ComfyUI models
+- **`list_models`**: List available ComfyUI checkpoint models
+- **`list_all_models`**: List installed models across all loader types: checkpoints, diffusion models (UNETLoader), text encoders (CLIPLoader), VAEs, and upscale models. Use this for UNET/CLIP/VAE-style pipelines (e.g. Flux, Z-Image-Turbo, Ideogram4)
 - **`get_defaults`**: Get current default values
 - **`set_defaults`**: Set default values (with optional persistence)
 
 ### Workflow Tools
 
-- **`list_workflows`**: List all available workflows
-- **`run_workflow`**: Run any workflow with custom parameters
+- **`list_workflows`**: List all available workflows, including workflows saved in ComfyUI that have not been used yet (marked `not_yet_cached`)
+- **`run_workflow`**: Run any workflow with custom parameters. Unknown workflow IDs are auto-discovered from ComfyUI (see [Workflow Auto-Discovery](#workflow-auto-discovery)). A random `seed` and `steps=20` are filled in when not provided
+
+### Lifecycle Tools (optional, requires control API)
+
+- **`start_comfyui`**: Start ComfyUI if it isn't running, and wait until it is ready. Idempotent. Refreshes the server's cached model lists after start
+- **`stop_comfyui`**: Stop ComfyUI to free GPU/RAM
+- **`get_comfyui_status`**: Report whether ComfyUI is running
 
 ### Publish Tools
 
@@ -221,7 +241,16 @@ See [docs/HOW_TO_TEST_PUBLISH.md](docs/HOW_TO_TEST_PUBLISH.md) for detailed usag
 
 ## Custom Workflows
 
-Add custom workflows by placing JSON files in the `workflows/` directory. Workflows are automatically discovered and exposed as MCP tools.
+Add custom workflows by placing JSON files in the workflow directory. Workflows are automatically discovered and exposed as MCP tools.
+
+The workflow directory defaults to `workflows/` in this repo, which only ships example workflows. To keep your own
+workflows separate from the code, point `COMFY_MCP_WORKFLOW_DIR` at a folder outside the repo:
+
+```bash
+export COMFY_MCP_WORKFLOW_DIR=~/.config/comfyui-mcp/workflows
+```
+
+When this is set, **only** that folder is scanned. Copy in any example workflows you still want (e.g. `generate_image.json`).
 
 ### Workflow Placeholders
 
@@ -244,6 +273,66 @@ Use `PARAM_*` placeholders in workflow JSON to expose parameters:
 ```
 
 The tool name is derived from the filename (e.g., `my_workflow.json` → `my_workflow` tool).
+
+---
+
+## Fork Additions
+
+### On-Demand ComfyUI Lifecycle
+
+Instead of keeping ComfyUI resident, you can let agents start and stop it on demand. The lifecycle tools don't manage
+the process themselves. They call a small, separate **control API** service (not included in this repo) that you run
+alongside ComfyUI, e.g. as a systemd service. It should also stop ComfyUI after a period of inactivity.
+
+Every request sends the header `X-Control-Token: $COMFYUI_CONTROL_TOKEN`. The control API must implement:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/start` | Start ComfyUI (if needed) and block until it is ready |
+| `POST` | `/stop` | Stop ComfyUI |
+| `GET` | `/status` | Return running state |
+| `GET` | `/workflows` | List ComfyUI saved workflows: `{"workflows": [{"name", "convertible", "reason"}]}` |
+| `GET` | `/workflows/{name}` | Return a saved workflow converted to API format: `{"prompt": {...}}` |
+
+Without a control API, the rest of the server works as upstream. The lifecycle tools simply return errors.
+
+### Workflow Auto-Discovery
+
+When `run_workflow` is called with a workflow ID that is not in the workflow directory, the server:
+
+1. Slugifies the ID (`"Sample Txt 2 Image"` → `sample_txt_2_image`) and looks for a matching workflow via the control API's `/workflows`
+2. Fetches it in API format and adds placeholders automatically:
+   - `PARAM_PROMPT` / `PARAM_NEGATIVE_PROMPT` on the `CLIPTextEncode` nodes linked to the sampler's positive/negative inputs
+   - `PARAM_INT_SEED` on the sampler's `seed` (or `RandomNoise.noise_seed`)
+   - `PARAM_INT_STEPS` on `steps`
+3. Saves the result to the workflow directory, so later calls (and restarts) use the saved copy
+
+Save a workflow in ComfyUI and it is usable by name. No code changes are needed. ComfyUI must be running
+for the conversion step (call `start_comfyui` first). Review auto-generated files and adjust placeholders if the heuristic
+picks the wrong node.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `COMFYUI_URL` | `http://localhost:8188` | ComfyUI server URL |
+| `COMFY_MCP_HOST` | `0.0.0.0` | MCP server bind address. Set `127.0.0.1` to accept local connections only |
+| `COMFY_MCP_PORT` | `9001` | MCP server port |
+| `COMFY_MCP_WORKFLOW_DIR` | `./workflows` | Workflow directory (can be outside the repo) |
+| `COMFYUI_CONTROL_URL` | `http://127.0.0.1:8189` | Control API URL (lifecycle + auto-discovery) |
+| `COMFYUI_CONTROL_TOKEN` | *(empty)* | Shared secret sent as `X-Control-Token`. Keep it in an env file, never in the repo |
+
+See [docs/REFERENCE.md](docs/REFERENCE.md) for the `COMFY_MCP_DEFAULT_*` and other upstream variables.
+
+Example systemd user unit loading these from an env file:
+
+```ini
+[Service]
+WorkingDirectory=%h/mcp-servers/comfyui-mcp-server
+EnvironmentFile=%h/.config/comfyui-mcp/env
+ExecStart=%h/mcp-servers/comfyui-mcp-server/.venv/bin/python server.py
+Restart=on-failure
+```
 
 ---
 
@@ -285,19 +374,23 @@ comfyui-mcp-server/
 │   ├── asset.py
 │   ├── job.py             # Job management tools
 │   ├── configuration.py
+│   ├── lifecycle.py       # start/stop/status via control API
+│   ├── dynamic_workflows.py  # workflow auto-discovery
+│   ├── publish.py
 │   └── workflow.py
 ├── models/                # Data models
 │   ├── workflow.py
 │   └── asset.py
-└── workflows/             # Workflow JSON files
+└── workflows/             # Example workflows (default COMFY_MCP_WORKFLOW_DIR)
+    ├── basic_api_test.json
     ├── generate_image.json
     └── generate_song.json
 ```
 
 ## Notes
 
-- The server binds to localhost by default. Do not expose it publicly without authentication or a reverse proxy.
-- Ensure your models exist in `<ComfyUI_dir>/models/checkpoints/`
+- The server binds to `0.0.0.0` by default (all interfaces), so it is reachable from your LAN. Set `COMFY_MCP_HOST=127.0.0.1` for local-only access. Do not expose it publicly without authentication or a reverse proxy.
+- Ensure your models exist in the matching `<ComfyUI_dir>/models/` subfolder (`checkpoints/`, `diffusion_models/`, `text_encoders/`, `vae/`, `upscale_models/`)
 - Server uses **streamable-http** transport (HTTP-based, not WebSocket)
 - Workflows are auto-discovered - no code changes needed
 - Assets expire after 24 hours (configurable)
@@ -310,23 +403,29 @@ comfyui-mcp-server/
 ## Troubleshooting
 
 **Server won't start:**
-- Check ComfyUI is running on port 8188 (default)
+- The server no longer requires ComfyUI at boot. If it is offline, a notice is printed and you can call `start_comfyui` later
+- Check port `9001` isn't already in use (change with `COMFY_MCP_PORT`)
 - Verify Python 3.8+ is installed (`python --version`)
 - Check all dependencies are installed: `pip install -r requirements.txt`
 - Check server logs for specific error messages
 
 **Client can't connect:**
-- Verify server shows "Server running at http://127.0.0.1:9000/mcp" in the console
-- Test server directly: `curl http://127.0.0.1:9000/mcp` (should return MCP response)
+- Verify the server prints "Endpoint: http://127.0.0.1:9001/mcp" in the console
+- Test server directly: `curl http://127.0.0.1:9001/mcp` (should return MCP response)
 - Check `.mcp.json` is in project root (or correct location for your client)
 - Try both `"type": "streamable-http"` and `"type": "http"` - both are supported
 - For Cursor-specific issues, see [docs/MCP_CONFIG_README.md](docs/MCP_CONFIG_README.md)
 
 **Tools not appearing:**
-- Check `workflows/` directory has JSON files with `PARAM_*` placeholders
+- Check the workflow directory (`COMFY_MCP_WORKFLOW_DIR`, default `workflows/`) has JSON files with `PARAM_*` placeholders
 - Check server logs for workflow parsing errors
 - Verify ComfyUI has required custom nodes installed (if using custom workflows)
-- Restart the MCP server after adding new workflows
+- Restart the MCP server after adding new workflows (auto-discovered workflows work via `run_workflow` immediately, and become named tools after a restart)
+
+**Lifecycle tools / auto-discovery fail:**
+- Check the control API is running at `COMFYUI_CONTROL_URL`
+- Check `COMFYUI_CONTROL_TOKEN` matches the control API's token
+- Auto-discovery needs ComfyUI running to convert workflows. Call `start_comfyui` first
 
 **Asset not found errors:**
 - Assets expire after 24 hours by default (configurable via `COMFY_MCP_ASSET_TTL_HOURS`)

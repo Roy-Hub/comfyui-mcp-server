@@ -150,3 +150,14 @@ def test_edit_while_idle_removes_stale_copy(tmp_path, control):
     result = dw.sync_workflows(tmp_path, comfy_running=False)
     assert result["book_cover"]["status"] == "preview"
     assert not (tmp_path / "book_cover.json").exists()
+
+
+def test_workflow_manager_ignores_sync_sidecars(tmp_path):
+    """Startup must not treat <id>.meta.json sidecars as workflows."""
+    from managers.workflow_manager import WorkflowManager
+
+    (tmp_path / "book_cover.json").write_text(json.dumps(dw._parameterize(_guider_api_graph())[0]))
+    (tmp_path / "book_cover.meta.json").write_text(json.dumps({"source": "comfyui", "status": "ready"}))
+    manager = WorkflowManager(tmp_path)
+    assert [d.workflow_id for d in manager.tool_definitions] == ["book_cover"]
+    assert [w["id"] for w in manager.get_workflow_catalog()] == ["book_cover"]

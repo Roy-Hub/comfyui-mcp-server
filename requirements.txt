@@ -1,5 +1,6 @@
 # Core dependencies
 requests>=2.31.0
+websocket-client>=1.6  # live job progress from ComfyUI's /ws
 mcp>=0.9.0
 
 # Image processing (required for view_image tool)

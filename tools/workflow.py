@@ -30,7 +30,8 @@ def register_workflow_tools(
     workflow_manager,
     comfyui_client,
     defaults_manager,
-    asset_registry
+    asset_registry,
+    progress_tracker=None
 ):
     """Register workflow tools with the MCP server"""
 
@@ -191,6 +192,13 @@ def register_workflow_tools(
                 workflow,
                 preferred_output_keys=output_preferences,
             )
+            if progress_tracker is not None and result.get("prompt_id"):
+                # Lets finished runs of this workflow inform later ETAs.
+                progress_tracker.label(result["prompt_id"], workflow_id)
+                if result.get("status") == "running":
+                    progress = progress_tracker.snapshot(result["prompt_id"], workflow)
+                    if progress:
+                        result = {**result, "progress": progress}
 
             # Register asset and build response
             response = register_and_build_response(

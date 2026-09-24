@@ -15,6 +15,7 @@ from mcp.server.fastmcp import FastMCP
 from comfyui_client import ComfyUIClient
 from managers.asset_registry import AssetRegistry
 from managers.defaults_manager import DefaultsManager
+from managers.progress_tracker import ProgressTracker
 from managers.publish_manager import PublishConfig, PublishManager
 from managers.workflow_manager import WorkflowManager
 from tools.asset import register_asset_tools
@@ -137,6 +138,12 @@ if not check_comfyui_available(COMFYUI_URL):
 
 # Global ComfyUI client (fallback since context isn't available)
 comfyui_client = ComfyUIClient(COMFYUI_URL)
+
+# Listens to ComfyUI's progress events (reconnecting while it's idle) so job
+# status can report step progress and ETAs.
+progress_tracker = ProgressTracker(COMFYUI_URL)
+comfyui_client.client_id = progress_tracker.client_id
+progress_tracker.start()
 workflow_manager = WorkflowManager(WORKFLOW_DIR)
 defaults_manager = DefaultsManager(comfyui_client)
 asset_registry = AssetRegistry(ttl_hours=ASSET_TTL_HOURS, comfyui_base_url=COMFYUI_URL)
@@ -199,12 +206,12 @@ mcp = FastMCP(
 
 # Register all MCP tools
 register_configuration_tools(mcp, comfyui_client, defaults_manager)
-register_workflow_tools(mcp, workflow_manager, comfyui_client, defaults_manager, asset_registry)
+register_workflow_tools(mcp, workflow_manager, comfyui_client, defaults_manager, asset_registry, progress_tracker)
 register_asset_tools(mcp, asset_registry)
 if WORKFLOW_TOOLS:
     register_workflow_generation_tools(mcp, workflow_manager, comfyui_client, defaults_manager, asset_registry)
 register_regenerate_tool(mcp, comfyui_client, asset_registry)
-register_job_tools(mcp, comfyui_client, asset_registry)
+register_job_tools(mcp, comfyui_client, asset_registry, progress_tracker)
 register_lifecycle_tools(mcp, comfyui_client, defaults_manager)
 # Always register publish tools (unconditional)
 if publish_manager:

@@ -8,37 +8,52 @@ from mcp.server.fastmcp import FastMCP
 logger = logging.getLogger("MCP_Server")
 
 
+def _prompt_of(item) -> Optional[Dict[str, Any]]:
+    """Queue entries are [number, prompt_id, prompt, extra_data, outputs]."""
+    return item[2] if isinstance(item, list) and len(item) > 2 and isinstance(item[2], dict) else None
+
+
+def _pending_in_order(queue_pending: list) -> list:
+    items = [i for i in queue_pending if isinstance(i, list) and len(i) > 1]
+    return sorted(items, key=lambda i: i[0] if isinstance(i[0], (int, float)) else 0)
+
+
 def register_job_tools(
     mcp: FastMCP,
     comfyui_client,
-    asset_registry
+    asset_registry,
+    progress_tracker=None
 ):
     """Register job and queue management tools with the MCP server"""
+
+    def _progress(item) -> Optional[dict]:
+        if progress_tracker is None:
+            return None
+        return progress_tracker.snapshot(item[1], _prompt_of(item))
     
     @mcp.tool()
     def get_queue_status() -> dict:
-        """Get the current ComfyUI queue status.
-        
-        Returns information about queued and running jobs, including:
-        - Currently running prompts
-        - Queued prompts waiting to execute
-        - Queue position and estimated wait times
-        
-        This tool provides async awareness - the AI can check if a job
-        is still running or queued before polling for completion.
-        
+        """Get the current ComfyUI queue: running jobs with live progress, and waiting jobs.
+
         Returns:
-            Dict with 'queue_running' and 'queue_pending' lists, each containing
-            prompt IDs and associated metadata.
+            Dict with 'queue_running' (prompt_id + progress: stage, step/steps,
+            seconds_per_step, ETA) and 'queue_pending' (prompt_id + position),
+            plus counts.
         """
         try:
             queue_data = comfyui_client.get_queue()
+            running = [i for i in queue_data.get("queue_running", []) if isinstance(i, list) and len(i) > 1]
+            pending = _pending_in_order(queue_data.get("queue_pending", []))
             return {
                 "status": "success",
-                "queue_running": queue_data.get("queue_running", []),
-                "queue_pending": queue_data.get("queue_pending", []),
-                "running_count": len(queue_data.get("queue_running", [])),
-                "pending_count": len(queue_data.get("queue_pending", []))
+                "queue_running": [
+                    {"prompt_id": i[1], **({"progress": p} if (p := _progress(i)) else {})} for i in running
+                ],
+                "queue_pending": [
+                    {"prompt_id": i[1], "position": n} for n, i in enumerate(pending, start=1)
+                ],
+                "running_count": len(running),
+                "pending_count": len(pending)
             }
         except Exception as e:
             logger.exception("Failed to get queue status")
@@ -83,22 +98,29 @@ def register_job_tools(
                 for item in queue_running:
                     if isinstance(item, list) and len(item) > 1:
                         if item[1] == prompt_id:
-                            return {
+                            response = {
                                 "status": "running",
                                 "prompt_id": prompt_id,
                                 "message": "Job is currently running",
                                 "execution_id": item[0] if len(item) > 0 else None
                             }
-                
-                for item in queue_pending:
-                    if isinstance(item, list) and len(item) > 1:
-                        if item[1] == prompt_id:
-                            return {
-                                "status": "queued",
-                                "prompt_id": prompt_id,
-                                "message": "Job is queued and waiting to run",
-                                "position": queue_pending.index(item) + 1 if item in queue_pending else None
-                            }
+                            progress = _progress(item)
+                            if progress:
+                                response["progress"] = progress
+                                eta = progress.get("eta_seconds", progress.get("stage_eta_seconds"))
+                                if eta is not None:
+                                    response["message"] = f"Job is running - about {eta}s left"
+                            return response
+
+                for position, item in enumerate(_pending_in_order(queue_pending), start=1):
+                    if item[1] == prompt_id:
+                        return {
+                            "status": "queued",
+                            "prompt_id": prompt_id,
+                            "message": "Job is queued and waiting to run",
+                            "position": position,
+                            "jobs_ahead": position - 1 + len(queue_running)
+                        }
             except Exception as queue_error:
                 # If queue check fails, continue to history check
                 logger.warning(f"Failed to check queue status: {queue_error}")

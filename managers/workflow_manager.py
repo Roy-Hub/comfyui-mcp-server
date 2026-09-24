@@ -289,6 +289,9 @@ class WorkflowManager:
             return definitions
 
         for workflow_path in sorted(self.workflows_dir.glob("*.json")):
+            # Sidecar metadata, not a workflow
+            if workflow_path.name.endswith(".meta.json"):
+                continue
             try:
                 with open(workflow_path, "r", encoding="utf-8") as handle:
                     workflow = json.load(handle)
@@ -372,6 +375,8 @@ class WorkflowManager:
     def _extract_parameters(self, workflow: Dict[str, Any]):
         parameters: "OrderedDict[str, WorkflowParameter]" = OrderedDict()
         for node_id, node in workflow.items():
+            if not isinstance(node, dict):
+                continue
             inputs = node.get("inputs", {})
             if not isinstance(inputs, dict):
                 continue

@@ -13,6 +13,9 @@ logger = logging.getLogger("ComfyUIClient")
 class ComfyUIClient:
     def __init__(self, base_url):
         self.base_url = base_url
+        # ComfyUI only emits executing/progress events for prompts submitted
+        # with a client_id, and only to that client's websocket.
+        self.client_id = None
         self.available_models = self._get_available_models()
     
     def refresh_models(self):
@@ -229,7 +232,10 @@ class ComfyUIClient:
 
     def _queue_workflow(self, workflow: Dict[str, Any]):
         logger.info("Submitting workflow to ComfyUI...")
-        response = requests.post(f"{self.base_url}/prompt", json={"prompt": workflow}, timeout=30)
+        payload = {"prompt": workflow}
+        if self.client_id:
+            payload["client_id"] = self.client_id
+        response = requests.post(f"{self.base_url}/prompt", json=payload, timeout=30)
         if response.status_code != 200:
             raise Exception(f"Failed to queue workflow: {response.status_code} - {response.text}")
         try:

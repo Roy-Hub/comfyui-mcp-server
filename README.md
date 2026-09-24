@@ -180,8 +180,10 @@ No migration is required unless you want the new capabilities.
 
 ### Job Management Tools
 
-- **`get_queue_status`**: Check ComfyUI queue state (running/pending jobs) - provides async awareness
-- **`get_job`**: Poll job completion status by prompt_id - check if a job has finished
+- **`get_queue_status`**: Running jobs with live progress, and waiting jobs with their queue position
+- **`get_job`**: Poll a job by prompt_id. While it runs, `progress` shows the current stage (node type), `step`/`steps`,
+  `seconds_per_step`, `stage_eta_seconds`, nodes done/total, and `eta_seconds` once the same workflow has completed
+  before in this server session. Queued jobs report `position`/`jobs_ahead`
 - **`list_assets`**: Browse recently generated assets - enables AI memory and iteration
 - **`get_asset_metadata`**: Get full provenance and parameters for an asset - includes workflow history
 - **`cancel_job`**: Cancel a queued or running job
@@ -337,6 +339,14 @@ returned as `sample_prompt`, so agents can match the expected style. For example
 structured JSON prompts, and the description says so.
 
 Workflow ids are slugified ComfyUI names (`"Sample Txt 2 Image"` → `sample_txt_2_image`). `run_workflow` accepts either.
+
+### Job Progress
+
+ComfyUI only reports step progress over its WebSocket, and only to the client that submitted the prompt.
+The server therefore submits prompts with its own `client_id` and keeps a background WebSocket listener
+(reconnecting while ComfyUI is idle). That listener feeds the `progress` block in `get_job`,
+`get_queue_status`, and `run_workflow` responses that return before the job finishes. Jobs submitted by other
+clients (e.g. the ComfyUI UI) only show elapsed time.
 
 ### Environment Variables
 

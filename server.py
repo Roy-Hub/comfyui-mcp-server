@@ -21,6 +21,7 @@ from tools.asset import register_asset_tools
 from tools.configuration import register_configuration_tools
 from tools.generation import register_workflow_generation_tools, register_regenerate_tool
 from tools.job import register_job_tools
+from tools.lifecycle import register_lifecycle_tools
 from tools.publish import register_publish_tools
 from tools.workflow import register_workflow_tools
 
@@ -119,16 +120,16 @@ def wait_for_comfyui(base_url: str, max_retries: int = COMFYUI_MAX_RETRIES,
 # Print startup banner
 print_startup_banner()
 
-# Check ComfyUI availability before initializing clients
+# ComfyUI runs on-demand (started via the start_comfyui tool), so it is
+# normal and expected for it to be offline when this server boots. Don't
+# block or exit on that — just note it and move on; ComfyUIClient itself
+# already degrades gracefully (empty model list) when ComfyUI is offline.
 if not check_comfyui_available(COMFYUI_URL):
-    if not wait_for_comfyui(COMFYUI_URL):
-        print("\n" + "=" * 70)
-        print("[X] ERROR: ComfyUI is not available after all retry attempts!")
-        print("=" * 70)
-        print(f"  Please ensure ComfyUI is running at: {COMFYUI_URL}")
-        print("  Start ComfyUI first, then restart this server.")
-        print("=" * 70 + "\n")
-        sys.exit(1)
+    print("\n" + "=" * 70)
+    print("[!] ComfyUI is not running yet - call start_comfyui to launch it.")
+    print(f"  Expected at: {COMFYUI_URL}")
+    print("=" * 70 + "\n")
+    logger.info(f"ComfyUI not running at startup (expected - it's started on demand): {COMFYUI_URL}")
 
 # Global ComfyUI client (fallback since context isn't available)
 comfyui_client = ComfyUIClient(COMFYUI_URL)
@@ -181,12 +182,14 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
 
 
 # Initialize FastMCP with lifespan and port configuration
-# Using port 9000 for consistency with previous version
+# Port 9000 collides with Lemonade's WebSocket port on this host - default
+# to 9001 instead, overridable via env var.
 # Enable stateless_http to avoid requiring session management
 mcp = FastMCP(
     "ComfyUI_MCP_Server",
     lifespan=app_lifespan,
-    port=9000,
+    host=os.getenv("COMFY_MCP_HOST", "0.0.0.0"),
+    port=int(os.getenv("COMFY_MCP_PORT", "9001")),
     stateless_http=True
 )
 
@@ -197,6 +200,7 @@ register_asset_tools(mcp, asset_registry)
 register_workflow_generation_tools(mcp, workflow_manager, comfyui_client, defaults_manager, asset_registry)
 register_regenerate_tool(mcp, comfyui_client, asset_registry)
 register_job_tools(mcp, comfyui_client, asset_registry)
+register_lifecycle_tools(mcp, comfyui_client, defaults_manager)
 # Always register publish tools (unconditional)
 if publish_manager:
     register_publish_tools(mcp, asset_registry, publish_manager)
@@ -225,10 +229,10 @@ if __name__ == "__main__":
         print("[+] Server Ready".center(70))
         print("=" * 70)
         print(f"  Transport: streamable-http")
-        print(f"  Endpoint: http://127.0.0.1:9000/mcp")
+        print(f"  Endpoint: http://127.0.0.1:{os.getenv('COMFY_MCP_PORT', '9001')}/mcp")
         print(f"[+] ComfyUI verified at: {COMFYUI_URL}")
         print("=" * 70 + "\n")
-        logger.info("Starting MCP server with streamable-http transport on http://127.0.0.1:9000/mcp")
+        logger.info(f"Starting MCP server with streamable-http transport on http://127.0.0.1:{os.getenv('COMFY_MCP_PORT', '9001')}/mcp")
         logger.info(f"ComfyUI verified at: {COMFYUI_URL}")
         try:
             mcp.run(transport="streamable-http")

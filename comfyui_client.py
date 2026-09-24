@@ -55,6 +55,50 @@ class ComfyUIClient:
             logger.warning(f"Error fetching models: {e}")
             return []
 
+    # Loader classes whose combo field lists the actual installed model
+    # files - CheckpointLoaderSimple only covers one of these, so
+    # list_models (which drives generate_image's default-model validation)
+    # deliberately doesn't touch this; list_all_models below is additive.
+    _MODEL_LOADER_FIELDS = {
+        "checkpoints": ("CheckpointLoaderSimple", "ckpt_name"),
+        "diffusion_models": ("UNETLoader", "unet_name"),
+        "text_encoders": ("CLIPLoader", "clip_name"),
+        "vae": ("VAELoader", "vae_name"),
+        "upscale_models": ("UpscaleModelLoader", "model_name"),
+    }
+
+    @staticmethod
+    def _extract_combo_options(field_info):
+        """ComfyUI has two shapes for a combo dropdown's option list across
+        node versions: legacy `[[opt, ...], {config}]` and newer
+        `["COMBO", {"options": [opt, ...], ...}]`. Handle both."""
+        if not isinstance(field_info, list) or not field_info:
+            return []
+        if isinstance(field_info[0], list):
+            return field_info[0]
+        if field_info[0] == "COMBO" and len(field_info) > 1 and isinstance(field_info[1], dict):
+            return field_info[1].get("options", [])
+        return []
+
+    def get_all_models(self) -> Dict[str, list]:
+        """List installed models across every loader type (checkpoints,
+        UNETLoader diffusion models, CLIPLoader text encoders, VAEs,
+        upscale models) - not just checkpoints. Each category is fetched
+        independently so one missing/errored node type doesn't blank out
+        the rest."""
+        result = {}
+        for category, (class_name, field_name) in self._MODEL_LOADER_FIELDS.items():
+            try:
+                response = requests.get(f"{self.base_url}/object_info/{class_name}", timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                field_info = data.get(class_name, {}).get("input", {}).get("required", {}).get(field_name, [])
+                result[category] = self._extract_combo_options(field_info)
+            except (requests.RequestException, ValueError, KeyError) as e:
+                logger.warning(f"Could not fetch {category} ({class_name}.{field_name}): {e}")
+                result[category] = []
+        return result
+
     def run_custom_workflow(self, workflow: Dict[str, Any], preferred_output_keys: Sequence[str] | None = None, max_attempts: int = 30):
         if preferred_output_keys is None:
             preferred_output_keys = ("images", "image", "gifs", "gif", "audio", "audios", "files")

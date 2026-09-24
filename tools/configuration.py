@@ -27,6 +27,21 @@ def register_configuration_tools(
         }
 
     @mcp.tool()
+    def list_all_models() -> dict:
+        """List every installed model across all loader types, not just
+        checkpoints - diffusion models (UNETLoader), text encoders
+        (CLIPLoader), VAEs (VAELoader), and upscale models, in addition to
+        checkpoints. Use this when a workflow uses a non-checkpoint-based
+        pipeline (e.g. Ideogram4, Z-Image-Turbo, Flux-style workflows that
+        load UNET/CLIP/VAE separately instead of one combined checkpoint).
+        """
+        by_category = comfyui_client.get_all_models()
+        return {
+            **by_category,
+            "total_count": sum(len(v) for v in by_category.values()),
+        }
+
+    @mcp.tool()
     def get_defaults() -> dict:
         """Get current effective defaults for image, audio, and video generation.
         

@@ -8,7 +8,8 @@ You run the server, connect a client, and issue tool calls. Everything else is o
 
 > **Fork note:** This is a fork of [joenorton/comfyui-mcp-server](https://github.com/joenorton/comfyui-mcp-server). It adds:
 > - on-demand ComfyUI lifecycle tools (`start_comfyui`, `stop_comfyui`, `get_comfyui_status`)
-> - auto-discovery of workflows saved in ComfyUI
+> - live sync with the workflows saved in ComfyUI: new ones appear, edited ones update, deleted ones disappear,
+>   with sample prompts and descriptions for agents
 > - a `list_all_models` tool covering non-checkpoint loaders
 > - a configurable workflow directory kept outside the repo
 > - a configurable host/port (default port `9001`)
@@ -194,12 +195,16 @@ No migration is required unless you want the new capabilities.
 
 ### Workflow Tools
 
-- **`list_workflows`**: List all available workflows, including workflows saved in ComfyUI that have not been used yet (marked `not_yet_cached`)
-- **`run_workflow`**: Run any workflow with custom parameters. Unknown workflow IDs are auto-discovered from ComfyUI (see [Workflow Auto-Discovery](#workflow-auto-discovery)). A random `seed` and `steps=20` are filled in when not provided
+- **`list_workflows`**: List the runnable workflows, synced live with ComfyUI's saved workflows (see [Workflow Sync](#workflow-sync)). Each entry has a description, inputs, saved defaults, and a `sample_prompt`. Does not start ComfyUI
+- **`run_workflow`**: Run a workflow by id (or ComfyUI name) with `overrides`. Starts ComfyUI automatically if it is idle. Omitted inputs use the workflow's saved values
+
+Set `COMFY_MCP_WORKFLOW_TOOLS=false` to expose workflows **only** through these two tools, with no named tool per
+workflow file (`generate_image`, ...). This keeps the tool list small and stable for agents while the workflow list
+changes underneath.
 
 ### Lifecycle Tools (optional, requires control API)
 
-- **`start_comfyui`**: Start ComfyUI if it isn't running, and wait until it is ready. Idempotent. Refreshes the server's cached model lists after start
+- **`start_comfyui`**: Start ComfyUI if it isn't running, and wait until it is ready. Idempotent. Refreshes the server's cached model lists after start. Optional, since `run_workflow` starts ComfyUI itself
 - **`stop_comfyui`**: Stop ComfyUI to free GPU/RAM
 - **`get_comfyui_status`**: Report whether ComfyUI is running
 
@@ -241,7 +246,9 @@ See [docs/HOW_TO_TEST_PUBLISH.md](docs/HOW_TO_TEST_PUBLISH.md) for detailed usag
 
 ## Custom Workflows
 
-Add custom workflows by placing JSON files in the workflow directory. Workflows are automatically discovered and exposed as MCP tools.
+The easiest way to add a workflow is to save it in ComfyUI. It is picked up automatically (see [Workflow Sync](#workflow-sync)).
+You can also place API-format JSON files with `PARAM_*` placeholders in the workflow directory yourself. These are
+listed alongside the synced ones and never pruned.
 
 The workflow directory defaults to `workflows/` in this repo, which only ships example workflows. To keep your own
 workflows separate from the code, point `COMFY_MCP_WORKFLOW_DIR` at a folder outside the repo:
@@ -251,6 +258,8 @@ export COMFY_MCP_WORKFLOW_DIR=~/.config/comfyui-mcp/workflows
 ```
 
 When this is set, **only** that folder is scanned. Copy in any example workflows you still want (e.g. `generate_image.json`).
+Synced ComfyUI workflows are cached in this folder too, as `<id>.json` + `<id>.meta.json`. Don't edit these by hand:
+edit the workflow in ComfyUI instead.
 
 ### Workflow Placeholders
 
@@ -291,25 +300,40 @@ Every request sends the header `X-Control-Token: $COMFYUI_CONTROL_TOKEN`. The co
 | `POST` | `/start` | Start ComfyUI (if needed) and block until it is ready |
 | `POST` | `/stop` | Stop ComfyUI |
 | `GET` | `/status` | Return running state |
-| `GET` | `/workflows` | List ComfyUI saved workflows: `{"workflows": [{"name", "convertible", "reason"}]}` |
-| `GET` | `/workflows/{name}` | Return a saved workflow converted to API format: `{"prompt": {...}}` |
+| `GET` | `/workflows` | List ComfyUI saved workflows: `{"workflows": [{"name", "mtime", "convertible", "reason"}]}`. `convertible` is `null` while ComfyUI is idle |
+| `GET` | `/workflows/{name}` | Return a saved workflow converted to API format: `{"prompt": {...}}`. Needs ComfyUI running |
+| `GET` | `/workflows/{name}?raw=1` | Return the saved UI graph as-is: `{"graph": {...}}`. Works while ComfyUI is idle |
 
-Without a control API, the rest of the server works as upstream. The lifecycle tools simply return errors.
+Without a control API, the rest of the server works as upstream. The lifecycle tools return errors, and
+`list_workflows` shows only local workflows.
 
-### Workflow Auto-Discovery
+### Workflow Sync
 
-When `run_workflow` is called with a workflow ID that is not in the workflow directory, the server:
+ComfyUI's saved workflows (`<ComfyUI>/user/default/workflows`, read through the control API) are the source of
+truth. Every `list_workflows` and `run_workflow` call reconciles the local cache with them:
 
-1. Slugifies the ID (`"Sample Txt 2 Image"` → `sample_txt_2_image`) and looks for a matching workflow via the control API's `/workflows`
-2. Fetches it in API format and adds placeholders automatically:
-   - `PARAM_PROMPT` / `PARAM_NEGATIVE_PROMPT` on the `CLIPTextEncode` nodes linked to the sampler's positive/negative inputs
-   - `PARAM_INT_SEED` on the sampler's `seed` (or `RandomNoise.noise_seed`)
-   - `PARAM_INT_STEPS` on `steps`
-3. Saves the result to the workflow directory, so later calls (and restarts) use the saved copy
+- **New** workflows appear immediately. While ComfyUI is idle they are listed as `preview`: the description,
+  sample prompt and likely inputs come from the raw saved graph, so listing never starts ComfyUI.
+- When ComfyUI is running, workflows are converted to API format and cached as `ready`, with exact inputs.
+  `run_workflow` starts ComfyUI first, so a `preview` workflow can be run directly.
+- **Edited** workflows (changed modification time) are re-converted. An outdated copy is never run.
+- **Deleted** workflows are pruned from the cache and the list. Nothing is pruned if the control API is unreachable.
+- Workflows that can't be converted are listed as `not_convertible` with a reason. Currently this means workflows
+  that use subgraphs; unpack the subgraph in ComfyUI and save to fix it.
 
-Save a workflow in ComfyUI and it is usable by name. No code changes are needed. ComfyUI must be running
-for the conversion step (call `start_comfyui` first). Review auto-generated files and adjust placeholders if the heuristic
-picks the wrong node.
+Conversion only replaces four inputs with placeholders. Every other node (samplers, guiders, sigmas, custom noise
+handling) is kept exactly as saved:
+
+- `PARAM_PROMPT` / `PARAM_NEGATIVE_PROMPT` on the `CLIPTextEncode` nodes linked to the sampler's positive/negative inputs
+- `PARAM_INT_SEED` on the sampler's `seed` or a `RandomNoise.noise_seed`
+- `PARAM_INT_STEPS` on the sampler's or scheduler's `steps`
+
+The replaced values stay the defaults: steps and negative prompt default to what the workflow was saved with. The
+seed is kept if the workflow's seed is set to `fixed` in ComfyUI, and randomized otherwise. The saved prompt is
+returned as `sample_prompt`, so agents can match the expected style. For example, Ideogram workflows expect
+structured JSON prompts, and the description says so.
+
+Workflow ids are slugified ComfyUI names (`"Sample Txt 2 Image"` → `sample_txt_2_image`). `run_workflow` accepts either.
 
 ### Environment Variables
 
@@ -318,8 +342,9 @@ picks the wrong node.
 | `COMFYUI_URL` | `http://localhost:8188` | ComfyUI server URL |
 | `COMFY_MCP_HOST` | `0.0.0.0` | MCP server bind address. Set `127.0.0.1` to accept local connections only |
 | `COMFY_MCP_PORT` | `9001` | MCP server port |
-| `COMFY_MCP_WORKFLOW_DIR` | `./workflows` | Workflow directory (can be outside the repo) |
-| `COMFYUI_CONTROL_URL` | `http://127.0.0.1:8189` | Control API URL (lifecycle + auto-discovery) |
+| `COMFY_MCP_WORKFLOW_DIR` | `./workflows` | Workflow directory and sync cache (can be outside the repo) |
+| `COMFY_MCP_WORKFLOW_TOOLS` | `true` | Register a named tool per workflow file. Set `false` to use only `list_workflows`/`run_workflow` |
+| `COMFYUI_CONTROL_URL` | `http://127.0.0.1:8189` | Control API URL (lifecycle + workflow sync) |
 | `COMFYUI_CONTROL_TOKEN` | *(empty)* | Shared secret sent as `X-Control-Token`. Keep it in an env file, never in the repo |
 
 See [docs/REFERENCE.md](docs/REFERENCE.md) for the `COMFY_MCP_DEFAULT_*` and other upstream variables.
@@ -375,7 +400,7 @@ comfyui-mcp-server/
 │   ├── job.py             # Job management tools
 │   ├── configuration.py
 │   ├── lifecycle.py       # start/stop/status via control API
-│   ├── dynamic_workflows.py  # workflow auto-discovery
+│   ├── dynamic_workflows.py  # ComfyUI workflow sync
 │   ├── publish.py
 │   └── workflow.py
 ├── models/                # Data models
@@ -420,12 +445,13 @@ comfyui-mcp-server/
 - Check the workflow directory (`COMFY_MCP_WORKFLOW_DIR`, default `workflows/`) has JSON files with `PARAM_*` placeholders
 - Check server logs for workflow parsing errors
 - Verify ComfyUI has required custom nodes installed (if using custom workflows)
-- Restart the MCP server after adding new workflows (auto-discovered workflows work via `run_workflow` immediately, and become named tools after a restart)
+- Workflows saved in ComfyUI show up in `list_workflows` immediately. Named per-workflow tools (`COMFY_MCP_WORKFLOW_TOOLS=true`) only change after a restart
 
-**Lifecycle tools / auto-discovery fail:**
+**Lifecycle tools / workflow sync fail:**
 - Check the control API is running at `COMFYUI_CONTROL_URL`
 - Check `COMFYUI_CONTROL_TOKEN` matches the control API's token
-- Auto-discovery needs ComfyUI running to convert workflows. Call `start_comfyui` first
+- A workflow stuck at `preview` just means ComfyUI is idle. `run_workflow` or `start_comfyui` converts it
+- `not_convertible`: see the `reason`. Subgraphs must be unpacked in ComfyUI
 
 **Asset not found errors:**
 - Assets expire after 24 hours by default (configurable via `COMFY_MCP_ASSET_TTL_HOURS`)

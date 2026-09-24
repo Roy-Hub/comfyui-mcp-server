@@ -2,13 +2,27 @@
 
 import logging
 import random
+from pathlib import Path
 from typing import Any, Dict, Optional
 
+import requests
 from mcp.server.fastmcp import FastMCP
 from tools.helpers import register_and_build_response
-from tools.dynamic_workflows import ensure_workflow_cached, slugify, _control_api
+from tools.dynamic_workflows import (
+    ControlAPIError,
+    META_SUFFIX,
+    preview_inputs,
+    slugify,
+    sync_workflows,
+    _read_meta,
+)
+from tools.lifecycle import comfyui_running, start_comfyui_and_refresh
 
 logger = logging.getLogger("MCP_Server")
+
+USAGE = ("Pick a workflow by its description, write a prompt in the style of its sample_prompt, "
+         "then call run_workflow(workflow_id=<id>, overrides={'prompt': '...'}). "
+         "Other inputs are optional and default to the values the workflow was saved with.")
 
 
 def register_workflow_tools(
@@ -19,47 +33,88 @@ def register_workflow_tools(
     asset_registry
 ):
     """Register workflow tools with the MCP server"""
-    
+
+    def _running_or_none() -> Optional[bool]:
+        try:
+            return comfyui_running()
+        except requests.RequestException as e:
+            logger.warning("Could not reach control API for ComfyUI status: %s", e)
+            return None
+
+    def _sync(comfy_running: bool):
+        """Returns ({slug: meta}, None) or (None, error) if the control API
+        is unreachable - in which case the local cache is used untouched."""
+        try:
+            return sync_workflows(workflow_manager.workflows_dir, comfy_running), None
+        except ControlAPIError as e:
+            logger.warning("Workflow sync skipped: %s", e)
+            return None, str(e)
+
+    def _local_meta(workflow_id: str) -> dict:
+        return _read_meta(Path(workflow_manager.workflows_dir) / f"{workflow_id}{META_SUFFIX}") or {}
+
+    def _entry(workflow_id: str, meta: dict, local: Optional[dict]) -> dict:
+        summary = meta.get("summary") or {}
+        status = meta.get("status", "ready")
+        entry = {
+            "id": workflow_id,
+            "name": meta.get("name") or (local or {}).get("name") or workflow_id,
+            "description": meta.get("description") or (local or {}).get("description", ""),
+            "status": status,
+        }
+        if status == "ready" and local is not None:
+            entry["inputs"] = local["available_inputs"]
+        elif status in ("ready", "preview"):
+            entry["inputs"] = preview_inputs(summary)
+            entry["note"] = ("ComfyUI is idle, so these inputs are a preview. "
+                             "run_workflow starts ComfyUI and works as-is.")
+        else:
+            entry["reason"] = meta.get("reason")
+            entry["note"] = "This workflow can't be run until the reason above is fixed in ComfyUI."
+        if meta.get("defaults"):
+            entry["defaults"] = meta["defaults"]
+        if summary.get("sample_prompt"):
+            entry["sample_prompt"] = summary["sample_prompt"]
+        if summary.get("sample_negative_prompt"):
+            entry["sample_negative_prompt"] = summary["sample_negative_prompt"]
+        return entry
+
     @mcp.tool()
     def list_workflows() -> dict:
-        """List all available workflows in the workflow directory.
-        
-        Returns a catalog of workflows with their IDs, names, descriptions,
-        available inputs, and optional metadata.
+        """List the workflows you can run with run_workflow.
+
+        Always reflects the workflows currently saved in ComfyUI: newly saved
+        ones appear and deleted ones disappear on every call. Each entry has:
+        - id: pass to run_workflow
+        - description: output type, size, models, and prompt format
+        - inputs: what run_workflow accepts in overrides
+        - sample_prompt: the prompt the workflow was saved with - write new
+          prompts in the same style/format (some expect structured JSON)
+        - status: "ready", "preview" (ComfyUI idle; still runnable), or
+          "not_convertible" (see reason)
+        Does not start ComfyUI.
         """
-        catalog = workflow_manager.get_workflow_catalog()
+        running = _running_or_none()
+        synced, error = _sync(bool(running))
+        local = {w["id"]: w for w in workflow_manager.get_workflow_catalog()}
 
-        # Also surface ComfyUI-side saved workflows that haven't been used
-        # (and thus auto-cached) here yet, so they're discoverable before
-        # their first run_workflow call.
-        try:
-            known_slugs = {slugify(w["id"]) for w in catalog}
-            remote = _control_api("/workflows")
-            for w in remote.get("workflows", []):
-                slug = slugify(w["name"])
-                # convertible is None (unknown) when ComfyUI isn't running -
-                # list it optimistically then; only skip a confirmed False.
-                if slug in known_slugs or w.get("convertible") is False:
-                    continue
-                catalog.append({
-                    "id": slug,
-                    "name": w["name"],
-                    "description": (
-                        f"Saved in ComfyUI, not yet used here - call "
-                        f"run_workflow(workflow_id='{slug}', overrides={{'prompt': '...'}}) "
-                        f"to auto-discover and register it as a full tool."
-                    ),
-                    "available_inputs": {},
-                    "not_yet_cached": True,
-                })
-        except Exception as e:
-            logger.warning(f"Could not check ComfyUI for additional saved workflows: {e}")
+        workflows = []
+        for workflow_id, meta in (synced or {}).items():
+            workflows.append(_entry(workflow_id, meta, local.get(workflow_id)))
+        for workflow_id, w in local.items():
+            if synced is not None and workflow_id in synced:
+                continue
+            workflows.append(_entry(workflow_id, _local_meta(workflow_id), w))
 
-        return {
-            "workflows": catalog,
-            "count": len(catalog),
-            "workflow_dir": str(workflow_manager.workflows_dir)
+        response = {
+            "workflows": workflows,
+            "count": len(workflows),
+            "comfyui_running": running,
+            "usage": USAGE,
         }
+        if error:
+            response["warning"] = f"Showing cached workflows only - could not check ComfyUI: {error}"
+        return response
 
     @mcp.tool()
     def run_workflow(
@@ -68,47 +123,52 @@ def register_workflow_tools(
         options: Optional[Dict[str, Any]] = None,
         return_inline_preview: bool = False
     ) -> dict:
-        """Run a saved ComfyUI workflow with constrained parameter overrides.
-        
+        """Run a workflow from list_workflows. Starts ComfyUI automatically if it is idle.
+
         Args:
-            workflow_id: The workflow ID (filename stem, e.g., "generate_image")
-            overrides: Optional dict of parameter overrides (e.g., {"prompt": "a cat", "width": 1024})
+            workflow_id: The workflow id from list_workflows (its ComfyUI name also works)
+            overrides: Inputs from list_workflows, e.g. {"prompt": "a cat"}. Omitted inputs
+                use the workflow's saved defaults (seed is random unless the workflow fixes it).
             options: Optional dict of execution options (reserved for future use)
             return_inline_preview: If True, include a small thumbnail base64 in response (256px, ~100KB)
-        
+
         Returns:
-            Result with asset_url, workflow_id, and execution metadata. If return_inline_preview=True,
+            Result with asset_id, asset_url, and execution metadata. If return_inline_preview=True,
             also includes inline_preview_base64 for immediate viewing.
         """
         if overrides is None:
             overrides = {}
 
-        # Normalize so a spaced/mixed-case ComfyUI display name ("Sample Txt
-        # 2 Image") resolves the same way as its cached filename.
+        # Accept a ComfyUI display name ("Sample Txt 2 Image") as well as its id.
         workflow_id = slugify(workflow_id)
 
-        # Load workflow, auto-discovering it from ComfyUI's own saved
-        # workflows (via the control API) on first use if we don't already
-        # have it cached locally - no code change needed to use a new
-        # workflow the user saves in ComfyUI.
-        workflow = workflow_manager.load_workflow(workflow_id)
-        discovery_note = None
-        if not workflow:
-            found, msg = ensure_workflow_cached(workflow_id, workflow_manager.workflows_dir)
-            if found:
-                discovery_note = msg
-                workflow = workflow_manager.load_workflow(workflow_id)
-            if not workflow:
-                return {"error": f"Workflow '{workflow_id}' not found. {msg}"}
+        started = False
+        try:
+            if not comfyui_running():
+                start_comfyui_and_refresh(comfyui_client, defaults_manager)
+                started = True
+        except requests.RequestException as e:
+            logger.warning("Could not check/start ComfyUI via control API: %s", e)
 
-        # apply_workflow_overrides only fills a value for an un-overridden
-        # PARAM_ placeholder from defaults_manager's per-namespace hardcoded
-        # defaults - which doesn't include "seed" at all (the named,
-        # auto-generated tool wrappers special-case random seed generation;
-        # this generic path doesn't). Without this, an un-overridden
-        # PARAM_INT_SEED/PARAM_INT_STEPS gets submitted to ComfyUI as a
-        # literal string and fails validation.
+        # Picks up workflows added or edited in ComfyUI since the last call.
+        synced, _ = _sync(True)
+        meta = (synced or {}).get(workflow_id) or _local_meta(workflow_id)
+        if meta.get("status") in ("not_convertible", "error"):
+            return {"error": f"Workflow '{workflow_id}' can't be run: {meta.get('reason')}"}
+
+        workflow = workflow_manager.load_workflow(workflow_id)
+        if not workflow:
+            available = sorted({*(synced or {}), *(w["id"] for w in workflow_manager.get_workflow_catalog())})
+            return {"error": f"Workflow '{workflow_id}' not found. Available: {available}"}
+
+        # Fill un-overridden placeholders with the workflow's saved values;
+        # otherwise PARAM_INT_SEED/PARAM_INT_STEPS would reach ComfyUI as
+        # literal strings and fail validation.
         parameters = workflow_manager._extract_parameters(workflow)
+        defaults = meta.get("defaults") or {}
+        for name in parameters:
+            if name not in overrides and name in defaults:
+                overrides = {**overrides, name: defaults[name]}
         if "seed" in parameters and "seed" not in overrides:
             overrides = {**overrides, "seed": random.randint(0, 2**32 - 1)}
         if "steps" in parameters and "steps" not in overrides:
@@ -147,8 +207,8 @@ def register_workflow_tools(
                 response["overrides_applied"] = override_report["overrides_applied"]
                 response["overrides_dropped"] = override_report["overrides_dropped"]
 
-            if discovery_note:
-                response["auto_discovery"] = discovery_note
+            if started:
+                response["comfyui_started"] = True
 
             return response
         except Exception as exc:

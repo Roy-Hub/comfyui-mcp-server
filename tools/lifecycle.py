@@ -23,42 +23,52 @@ def _call(path: str, method: str = "GET") -> dict:
     return resp.json()
 
 
-def register_lifecycle_tools(mcp: FastMCP, comfyui_client=None, defaults_manager=None):
-    """Register ComfyUI process lifecycle tools with the MCP server.
+def comfyui_running() -> bool:
+    """Whether ComfyUI is up, per the control API. Raises
+    requests.RequestException if the control API can't be reached."""
+    return bool(_call("/status", "GET").get("running"))
 
-    comfyui_client and defaults_manager, if given, get their model lists
-    refreshed after a successful start - both are constructed once at
-    MCP-server boot, before ComfyUI itself is running, so their cached
-    model lists are otherwise permanently empty (ComfyUI starts on demand,
-    after the MCP server). defaults_manager keeps its own separate cached
-    copy (_available_models_set), so both need refreshing independently.
+
+def start_comfyui_and_refresh(comfyui_client=None, defaults_manager=None) -> dict:
+    """Start ComfyUI via the control API (idempotent) and refresh model lists.
+
+    comfyui_client and defaults_manager are constructed once at MCP-server
+    boot, before ComfyUI itself is running, so their cached model lists are
+    otherwise permanently empty (ComfyUI starts on demand, after the MCP
+    server). defaults_manager keeps its own separate cached copy
+    (_available_models_set), so both need refreshing independently.
     """
+    result = _call("/start", "POST")
+    if comfyui_client is not None:
+        comfyui_client.refresh_models()
+    if defaults_manager is not None:
+        defaults_manager.refresh_model_set()
+        # refresh_model_set() only updates the available-models cache; it
+        # never clears _invalid_models (set once at boot, before ComfyUI
+        # was running, and otherwise only cleared by an explicit
+        # set_defaults call). Without this, a model that was "invalid"
+        # at startup stays permanently rejected even after it's real.
+        defaults_manager._invalid_models.clear()
+    return result
+
+
+def register_lifecycle_tools(mcp: FastMCP, comfyui_client=None, defaults_manager=None):
+    """Register ComfyUI process lifecycle tools with the MCP server."""
 
     @mcp.tool()
     def start_comfyui() -> dict:
         """Start the ComfyUI server if it isn't already running.
 
-        ComfyUI runs on-demand to save GPU/RAM rather than staying resident,
-        so call this before using generate_image, run_workflow, or any other
-        generation tool. Blocks until ComfyUI is ready to accept requests.
+        ComfyUI runs on-demand to save GPU/RAM rather than staying resident.
+        run_workflow starts it automatically, so calling this first is only
+        needed to warm it up ahead of time. Blocks until ComfyUI is ready.
         Safe to call even if it's already running (idempotent, just confirms
         status and re-arms the idle timer).
         """
         try:
-            result = _call("/start", "POST")
+            return start_comfyui_and_refresh(comfyui_client, defaults_manager)
         except requests.RequestException as e:
             return {"error": f"could not start ComfyUI: {e}"}
-        if comfyui_client is not None:
-            comfyui_client.refresh_models()
-        if defaults_manager is not None:
-            defaults_manager.refresh_model_set()
-            # refresh_model_set() only updates the available-models cache; it
-            # never clears _invalid_models (set once at boot, before ComfyUI
-            # was running, and otherwise only cleared by an explicit
-            # set_defaults call). Without this, a model that was "invalid"
-            # at startup stays permanently rejected even after it's real.
-            defaults_manager._invalid_models.clear()
-        return result
 
     @mcp.tool()
     def stop_comfyui() -> dict:

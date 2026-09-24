@@ -31,6 +31,10 @@ logger = logging.getLogger("MCP_Server")
 
 # Configuration paths
 WORKFLOW_DIR = Path(os.getenv("COMFY_MCP_WORKFLOW_DIR", str(Path(__file__).parent / "workflows")))
+# One named tool per workflow file (generate_image, ...). Set to false to
+# expose workflows only through list_workflows/run_workflow, which also
+# track workflows added or removed in ComfyUI without a restart.
+WORKFLOW_TOOLS = os.getenv("COMFY_MCP_WORKFLOW_TOOLS", "true").strip().lower() not in ("0", "false", "no", "off")
 
 # Asset registry configuration
 ASSET_TTL_HOURS = int(os.getenv("COMFY_MCP_ASSET_TTL_HOURS", "24"))
@@ -197,7 +201,8 @@ mcp = FastMCP(
 register_configuration_tools(mcp, comfyui_client, defaults_manager)
 register_workflow_tools(mcp, workflow_manager, comfyui_client, defaults_manager, asset_registry)
 register_asset_tools(mcp, asset_registry)
-register_workflow_generation_tools(mcp, workflow_manager, comfyui_client, defaults_manager, asset_registry)
+if WORKFLOW_TOOLS:
+    register_workflow_generation_tools(mcp, workflow_manager, comfyui_client, defaults_manager, asset_registry)
 register_regenerate_tool(mcp, comfyui_client, asset_registry)
 register_job_tools(mcp, comfyui_client, asset_registry)
 register_lifecycle_tools(mcp, comfyui_client, defaults_manager)

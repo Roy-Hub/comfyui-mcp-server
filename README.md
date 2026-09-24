@@ -301,7 +301,7 @@ Every request sends the header `X-Control-Token: $COMFYUI_CONTROL_TOKEN`. The co
 | `POST` | `/stop` | Stop ComfyUI |
 | `GET` | `/status` | Return running state |
 | `GET` | `/workflows` | List ComfyUI saved workflows: `{"workflows": [{"name", "mtime", "convertible", "reason"}]}`. `convertible` is `null` while ComfyUI is idle |
-| `GET` | `/workflows/{name}` | Return a saved workflow converted to API format: `{"prompt": {...}}`. Needs ComfyUI running |
+| `GET` | `/workflows/{name}` | Return a saved workflow converted to API format, with subgraphs unpacked: `{"prompt": {...}}`. Needs ComfyUI running |
 | `GET` | `/workflows/{name}?raw=1` | Return the saved UI graph as-is: `{"graph": {...}}`. Works while ComfyUI is idle |
 
 Without a control API, the rest of the server works as upstream. The lifecycle tools return errors, and
@@ -318,8 +318,11 @@ truth. Every `list_workflows` and `run_workflow` call reconciles the local cache
   `run_workflow` starts ComfyUI first, so a `preview` workflow can be run directly.
 - **Edited** workflows (changed modification time) are re-converted. An outdated copy is never run.
 - **Deleted** workflows are pruned from the cache and the list. Nothing is pruned if the control API is unreachable.
-- Workflows that can't be converted are listed as `not_convertible` with a reason. Currently this means workflows
-  that use subgraphs; unpack the subgraph in ComfyUI and save to fix it.
+- Workflows that use **subgraphs** (including nested ones) are unpacked during conversion, the same way ComfyUI does
+  when queueing. Inner nodes get ids like `57:27`, and values set on the subgraph node are passed through. Agents
+  see an ordinary workflow.
+- Workflows that can't be converted are listed as `not_convertible` with a reason, e.g. a node type from a custom
+  node pack that isn't installed.
 
 Conversion only replaces four inputs with placeholders. Every other node (samplers, guiders, sigmas, custom noise
 handling) is kept exactly as saved:
@@ -451,7 +454,7 @@ comfyui-mcp-server/
 - Check the control API is running at `COMFYUI_CONTROL_URL`
 - Check `COMFYUI_CONTROL_TOKEN` matches the control API's token
 - A workflow stuck at `preview` just means ComfyUI is idle. `run_workflow` or `start_comfyui` converts it
-- `not_convertible`: see the `reason`. Subgraphs must be unpacked in ComfyUI
+- `not_convertible`: see the `reason`. Usually a missing custom node. Install it in ComfyUI and the workflow converts on the next call
 
 **Asset not found errors:**
 - Assets expire after 24 hours by default (configurable via `COMFY_MCP_ASSET_TTL_HOURS`)
